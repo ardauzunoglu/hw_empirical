@@ -1,0 +1,9 @@
+# Install a PyTorch build appropriate for the cluster CUDA version first.
+torch>=2.5
+transformers>=4.57
+datasets>=3.2
+peft>=0.14
+accelerate>=1.2
+vllm>=0.8.5
+matplotlib>=3.8
+pandas>=2.1

@@ -1,0 +1,188 @@
+% Standalone, submission-ready write-up of the two empirical questions.
+% Compile from hw_empirical/ with: pdflatex empirical_answers.tex
+% The two answer bodies can also be copied into the corresponding \ans locations.
+\documentclass[10pt]{article}
+\usepackage[letterpaper,margin=0.67in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{microtype}
+\hypersetup{colorlinks=true,urlcolor=blue}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.45em}
+
+\begin{document}
+
+\section*{Empirical: Dense vs. Mixture-of-Experts Serving}
+
+I benchmarked the three checkpoints with vLLM 0.25.0 and PyTorch 2.11.0 on one
+NVIDIA H100 80GB.  All runs used tensor parallelism 1, online FP8 weight
+quantization, an FP8 KV cache with dynamically calculated scales, and disabled
+prefix caching.  Tokenization was excluded from timing.  For the prefill
+workload, I generated one token from a single input and varied its length.  For
+the decode workload, I used 32-token prompts, forced each response to contain
+512 new tokens, and varied the number of simultaneous responses.  Each point
+below is the mean of three timed trials after one warmup; the error bars are one
+sample standard deviation.
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=0.72\linewidth]{artifacts/serving/figures/prefill_throughput.pdf}
+  \caption{Prefill throughput as input context length changes.}
+  \label{fig:prefill}
+\end{figure}
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{rrrr}
+\toprule
+Input tokens & OLMo-2 1B dense & OLMoE 1B/7B & OLMo-2 7B dense \\
+\midrule
+128  & $31.9\!\pm\!1.3$ & $29.1\!\pm\!0.9$ & $17.5\!\pm\!0.5$ \\
+512  & $104.4\!\pm\!0.7$ & $74.7\!\pm\!0.2$ & $46.1\!\pm\!0.1$ \\
+2048 & $204.2\!\pm\!0.6$ & $125.7\!\pm\!0.4$ & $56.5\!\pm\!0.2$ \\
+3072 & $217.2\!\pm\!0.5$ & $164.0\!\pm\!0.2$ & $54.8\!\pm\!0.1$ \\
+\bottomrule
+\end{tabular}
+\caption{Mean prefill throughput in thousands of input tokens/s ($\pm$ one SD).}
+\end{table}
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=0.72\linewidth]{artifacts/serving/figures/decode_throughput.pdf}
+  \caption{Aggregate decode throughput as concurrency changes.}
+  \label{fig:decode}
+\end{figure}
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{rrrr}
+\toprule
+Parallel generations & OLMo-2 1B dense & OLMoE 1B/7B & OLMo-2 7B dense \\
+\midrule
+1  & $750\!\pm\!0$       & $621\!\pm\!0$       & $244\!\pm\!0$ \\
+2  & $1470\!\pm\!0$      & $1204\!\pm\!0$      & $485\!\pm\!0$ \\
+4  & $2914\!\pm\!1$      & $2238\!\pm\!0$      & $955\!\pm\!1$ \\
+8  & $5718\!\pm\!13$     & $4377\!\pm\!9$      & $1799\!\pm\!0$ \\
+16 & $10493\!\pm\!2$     & $8061\!\pm\!21$     & $3285\!\pm\!2$ \\
+32 & $17436\!\pm\!22$    & $13807\!\pm\!3$     & $5312\!\pm\!3$ \\
+\bottomrule
+\end{tabular}
+\caption{Mean decode throughput in output tokens/s ($\pm$ one SD), rounded to
+the nearest token/s; a displayed SD of zero is smaller than 0.5 token/s.}
+\end{table}
+
+Across every tested operating point, OLMoE was between the two dense models:
+there was no crossover at which it beat the 1B dense model, but it always beat
+the 7B dense model.  In prefill, OLMoE was 9--38\% slower than the 1B dense
+model but 62--199\% faster than the 7B dense model.  In decode, it was 17--23\%
+slower than the 1B model and 134--160\% faster than the 7B model.  At 32
+parallel generations, for example, throughput was 17,436, 13,807, and 5,312
+tokens/s for the small dense, MoE, and large dense models respectively.
+
+Thus, OLMoE behaves more like the small model in arithmetic cost: routing only
+about 1B active parameters per token makes its throughput substantially closer
+to the 1B dense checkpoint than to the 7B dense checkpoint.  It retains a
+large-model-like cost because its roughly 7B stored expert parameters must fit
+in memory and the system must route tokens and access different expert weights;
+this is consistent with its persistent throughput deficit relative to the 1B
+dense model.  Increasing concurrency improved aggregate decode throughput for
+all models by batching more work, without changing their ordering.  Prefill
+throughput initially increased as longer inputs amortized fixed launch and
+scheduling overheads; the 7B dense model saturated near 2048 tokens while the
+two smaller-active-compute models continued to improve through the tested
+range.
+
+The implementation is
+\path{hw_empirical/serving/benchmark_vllm.py}.  All individual repetitions and
+run metadata are in \path{hw_empirical/artifacts/serving/raw/}; the plotted
+means are in
+\path{hw_empirical/artifacts/serving/figures/serving_summary.csv}.
+
+\clearpage
+\section*{Empirical: Supervised Fine-Tuning with LoRA}
+
+I trained \path{Qwen/Qwen2.5-0.5B} for one epoch on a fixed set of 1,000
+\path{train_sft} conversations and evaluated on the first 100
+\path{test_sft} conversations.  Every run used the same H100 GPU, examples,
+seed, sequence length 512, effective batch size 16, learning rate $5\times
+10^{-5}$, BF16 precision, and evaluation schedule.  LoRA used PEFT's
+\path{target_modules="all-linear"}; full tuning updated all weights.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{lrrrrr}
+\toprule
+Variant & Trainable params. & Peak GPU GiB & Time (s) & Mean train loss & Final val. loss \\
+\midrule
+LoRA $r=1$  & 549,888     & 3.703 & 79.40 & 1.954 & 1.816 \\
+LoRA $r=4$  & 2,199,552   & 3.732 & 77.23 & 1.874 & 1.751 \\
+LoRA $r=16$ & 8,798,208   & 3.857 & 78.22 & 1.816 & 1.730 \\
+Full         & 494,032,768 & 6.486 & 39.72 & 1.748 & 1.665 \\
+\bottomrule
+\end{tabular}
+\caption{SFT results. Peak GPU memory is PyTorch peak reserved memory, and time is
+the trainer's training runtime.}
+\label{tab:sft}
+\end{table}
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=0.92\linewidth]{artifacts/sft/report/sft_loss_curves.pdf}
+  \caption{Training and held-out validation losses over the 63 optimizer steps.}
+  \label{fig:sft-loss}
+\end{figure}
+
+The LoRA parameter counts scaled linearly with rank and matched the analytical
+counts.  Peak reserved memory changed only from 3.703 GiB at rank 1 to 3.857
+GiB at rank 16 because frozen base weights and activations dominate the small
+adapter allocations.  The LoRA runs used 40--43\% less peak memory than full
+tuning.  In this particular H100 implementation, however, they took about
+1.94--2.00 times as long as full tuning.  LoRA therefore reduced memory but not
+wall-clock time here; this likely reflects adapter/wrapper overhead and kernel
+efficiency while the small full model fit comfortably.  This timing
+is an implementation-specific measurement, not a claim that full tuning is
+generally faster.
+
+The loss curves show a consistent capacity ordering.  From step 10 to the end,
+validation loss fell from 2.001 to 1.816 for rank 1, 1.940 to 1.751 for rank 4,
+1.833 to 1.730 for rank 16, and 1.754 to 1.665 for full tuning.  Training loss
+was noisier across logging windows but had the same overall downward trend and
+ordering.  Validation loss continued decreasing or remained nearly flat at the
+end, so there was no clear evidence of overfitting during this single epoch.
+Higher LoRA rank helped, although the improvement from rank 4 to 16 was smaller
+than that from rank 1 to 4, and full tuning achieved the lowest losses.
+
+For a qualitative comparison I greedily generated at most 192 tokens from the
+base model and all four tuned variants on the same five held-out user prompts.
+Fine-tuning produced a meaningful but inconsistent change:
+\begin{itemize}
+  \item On the free-verse prompt, the base model explained resilience in prose.
+  The tuned models instead began with concrete imagery, and the full model used
+  line-broken verse centered on climbing a mountain and reaching its summit.
+  \item On the affordable-dental-care prompt, the base model opened as a letter
+  (``Dear [Recipient]'').  Rank 16 and full tuning opened as speeches (``Good
+  morning, everyone''), following the requested format more directly.  Rank 1
+  still resembled a letter, while rank 4 adopted a speech opening but became
+  repetitive.
+  \item The improvement was not uniform.  Several variants repeated phrases or
+  hallucinated details; some science-answer completions emitted stray role or
+  template-like text, and all historical-fiction variants contained questionable
+  historical details.  One epoch on 1,000 examples therefore improved visible
+  instruction-following and conversational formatting, especially at higher
+  rank/full tuning, but did not make this 0.5B base model reliably correct or
+  fluent.
+\end{itemize}
+
+The implementation is \path{hw_empirical/sft/train_sft.py}.  Raw per-step
+losses and metrics are under \path{hw_empirical/artifacts/sft/runs/}; the shared
+data fingerprints are in \path{hw_empirical/artifacts/sft/data/manifest.json},
+and all matched generations are in
+\path{hw_empirical/artifacts/sft/report/qualitative_generations.jsonl}.
+
+\end{document}
